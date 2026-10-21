@@ -1,0 +1,9 @@
+{
+  "name": "shop2sheets",
+  "version": "3.1.0",
+  "description": "Sync Shopify orders, drafts and abandoned checkouts into a Google Sheet via Apps Script.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node test_code.js"
+  }
+}

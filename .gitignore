@@ -1,0 +1,17 @@
+# Secrets — never commit Shopify or Google credentials
+.env
+.env.*
+client_secret*.json
+*.pem
+
+# clasp (optional sync tool): .clasp.json is safe, auth is not
+.clasprc.json
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Node (only used to run tests)
+node_modules/
