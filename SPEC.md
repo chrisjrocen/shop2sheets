@@ -22,7 +22,7 @@ The current third-party app forces orders through its own checkout form. That fo
 - Two-way sync (sheet edits never go back to Shopify).
 - WhatsApp or email notifications for new orders or carts.
 - Multiple stores, inventory sync, customer segmentation.
-- Real-time updates (up to about 5 minutes of delay is accepted).
+- Real-time updates (a delay of up to one sync interval, hourly by default, is accepted).
 
 ## 3. Decisions
 
@@ -30,7 +30,7 @@ The current third-party app forces orders through its own checkout form. That fo
 |---|---|
 | Spreadsheet | Google Sheets, new spreadsheet with `Orders`, `Drafts`, `Abandoned checkouts`, `Settings`, `Log` tabs. Script is container-bound. |
 | Approach | Apps Script only, no hosting |
-| Sync method | **Polling** via time-driven trigger (every 5 min) against the Admin GraphQL API |
+| Sync method | **Polling** via a time-driven trigger against the Admin GraphQL API. Interval is chosen in Settings (`sync_every`, 5 min to daily; default 1 h) |
 | Why not webhooks | Apps Script web apps cannot read request headers (no HMAC verification) and answer POSTs with a redirect that Shopify may count as a failed delivery. Polling avoids both and self-heals. |
 | Auth | Dev Dashboard app + **client credentials grant** (see 5). Tokens last 24 hours, so the script requests and caches them itself. |
 | Scopes | `read_orders` + `read_customers` + `read_draft_orders` (all read-only). `read_customers` is required because an abandoned checkout exposes its email only through `customer`, and the `Customer` object requires that scope. |
@@ -70,7 +70,7 @@ Run one query for the most recent real order requesting `phone`, `customer { dis
 ## 5. Architecture and Shopify setup
 
 ```
-Time trigger (every 5 min)
+Time trigger (Settings > sync_every, default hourly)
    └─ syncAll()
         ├─ LockService script lock (skip if another run is active)
         ├─ getToken()          // stored in Script Properties, refreshed 1 h before expiry and on 401
@@ -131,9 +131,11 @@ Date started, Checkout ID, Client name, Items ordered, Price, Phone, Email, Loca
 
 ### 7.1 Orders
 - Query `orders(query: "updated_at:>='<cursor − overlap>' test:false", sortKey: UPDATED_AT)` with cursor pagination and a `first` size that respects the query cost budget.
-- Build one in-memory map per run: read the hidden Shopify ID column, then `id → row`. Found → overwrite the **managed columns only** on that row (never Remarks). Not found → append.
+- Build one in-memory map per run: read the hidden Shopify ID column, then `id → row`. Found → overwrite the **managed columns only** on that row (never Remarks). Not found → insert according to the tab's `row_order_*` setting: `top` (row 2, newest first, the default), `sorted` (above the first older row), `resort` (append, then sort the tab by date desc when rows were added) or `bottom` (append). Rows inserted above row 2 get plain formatting, and the grey status rule is re-anchored at row 2 because inserting above a range shifts it.
 - Columns are located **by header name**, so the owner may reorder, sort, filter, or insert rows without breaking anything.
 - The cursor advances only after the whole run succeeds. The 10-minute overlap plus dedupe protects against boundary misses.
+- A run that reaches the 4.5-minute budget saves its page cursor, the `since` it queried and its start time (`<CURSOR>_AFTER/_SINCE/_STARTED`), and schedules a one-off `continueSync` a minute later. That run resumes the identical query, and on completion sets the cursor to the first run's start. A failure while resuming drops the saved page cursor so the next run starts the window again.
+- Each run compares `sync_every` with the installed schedule and reinstalls the trigger if they differ, but only when run by the trigger's owner (`TRIGGER_OWNER`), so a second trigger never appears silently.
 
 ### 7.2 Abandoned checkouts
 - Query `abandonedCheckouts(query: "updated_at:>='<cursor − overlap>'")`, paginated. Drop checkouts with neither email nor phone.
@@ -171,13 +173,13 @@ Date started, Checkout ID, Client name, Items ordered, Price, Phone, Email, Loca
 - **Backfill failure:** if a backfill errors, its saved state is cleared so regular syncing is not blocked; re-run Backfill after fixing the cause.
 - **Errors:** try/catch around every run; write to `Log`; email `ALERT_EMAIL`, throttled to one per hour per error type.
 - **Rate limits:** read `extensions.cost.throttleStatus`; sleep and retry on `THROTTLED`; exponential backoff on 5xx.
-- **Quotas:** a 5-minute trigger using a few seconds per run is well within free Apps Script runtime and `UrlFetch` limits.
+- **Quotas:** even the shortest interval (5 min) using a few seconds per run is well within free Apps Script runtime and `UrlFetch` limits.
 - **API version:** pinned in one constant; review yearly as Shopify retires old versions.
 
 ## 10. UX
 
 - All config lives in `Settings`; no code edits after setup.
-- Custom menu **Shopify Sync**: Sync now, Backfill…, Test access (Gate 0), Show last error, Re-install trigger.
+- Custom menu **Shopify Sync**: Sync now, Backfill…, Test access (Gate 0), Sort newest first, Show last error, Re-install trigger, Remove my trigger.
 - Frozen header, filters on. Conditional formatting greys out finished rows: `Cancelled` orders, `Completed` drafts, `Recovered` checkouts. Guessed recovery matches are marked in the text itself (`#1050 (guess)`).
 
 ## 11. Edge cases
@@ -197,7 +199,7 @@ Date started, Checkout ID, Client name, Items ordered, Price, Phone, Email, Loca
 
 ## 12. Tradeoffs accepted
 
-- Up to ~5 minutes of delay instead of real time.
+- Up to one sync interval of delay (default 1 hour) instead of real time. Recovered checkouts wait max(30 min, 2 × interval) before being marked `no match`.
 - Polling uses more API calls than webhooks, which is negligible at this volume.
 - Apps Script has a 6-minute execution cap and no real test harness; fine at this scale.
 - Recovered order # may be a guess; the Recovered status itself is exact.

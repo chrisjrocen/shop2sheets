@@ -1,17 +1,18 @@
 # Shopify → Google Sheets sync
 
-Writes your Shopify orders and abandoned checkouts into a Google Sheet automatically, using Shopify's normal checkout. Free, no server: one Google Apps Script that checks Shopify every 5 minutes. Design details are in `SPEC.md`.
+Writes your Shopify orders and abandoned checkouts into a Google Sheet automatically, using Shopify's normal checkout. Free, no server: one Google Apps Script that checks Shopify on a schedule you choose (hourly by default). Design details are in `SPEC.md`.
 
 **What you get** (three tabs, named like the Shopify admin menu)
 - `Orders`: Date placed, Order ID, Client name, Items ordered, Price (order total), Phone, Location (address, area, city), Status (e.g. `Paid · Unfulfilled`, or `Cancelled`), **Remarks**.
 - `Drafts`: same, plus Order # once the draft is completed (the row stays, marked `Completed`).
 - `Abandoned checkouts`: only checkouts with an email or phone. Status flips to `Recovered` and Order # is filled when the customer buys.
 - **Remarks** is yours: the script never writes to it. Rows are matched by a hidden `Shopify ID` column, so you can sort, filter and reorder columns safely.
-- `Settings` (country code, timezone, price format, overlap, backfill days, alert throttle) and `Log` tabs.
+- `Settings` (country code, timezone, price format, overlap, backfill days, alert throttle, sync schedule, row order) and `Log` tabs.
+- Newest orders are added at the top by default (see *Schedule and row order* below).
 
 Test orders are skipped.
 
-Expect up to about 5 minutes between an order and its row.
+Expect up to one sync interval (default 1 hour) between an order and its row; **Sync now** fetches immediately.
 
 ## Setup (about 20 minutes)
 
@@ -37,7 +38,7 @@ Expect up to about 5 minutes between an order and its row.
 | `ALERT_EMAIL` | where failure emails should go |
 
 ### 3. Run it
-1. In the Apps Script editor, pick `setup` in the function dropdown and **Run**. Approve the permissions. This creates the tabs, formats the columns, and installs the 5-minute trigger.
+1. In the Apps Script editor, pick `setup` in the function dropdown and **Run**. Approve the permissions. This creates the tabs, formats the columns, and installs the sync trigger (hourly unless you change `sync_every`).
 2. Back in the sheet, reload the page. A **Shopify Sync** menu appears.
 3. **Shopify Sync → Test access (Gate 0).** Read the result before going further (see below).
 4. **Shopify Sync → Backfill…** and enter `60`. This imports the last 60 days. If it is large it continues by itself.
@@ -68,8 +69,33 @@ Your store is on the **Basic** plan, and Shopify's documentation is not clear on
 | Sync now | Runs one sync immediately |
 | Backfill… | Re-imports N days (safe to repeat; never duplicates) |
 | Test access (Gate 0) | Checks token, customer data, drafts and abandoned checkouts |
+| Sort newest first | One-time sort of all three tabs by date, newest first (asks first; Remarks move with their rows) |
 | Show last error | The most recent failure message |
-| Re-install trigger | Recreates the 5-minute trigger if it was removed |
+| Re-install trigger | Recreates the sync trigger, and applies a changed `sync_every` / `sync_hour` right away |
+| Remove my trigger | Removes **your** sync trigger (Google does not let anyone remove another person's) |
+
+### Schedule and row order
+
+These rows in the `Settings` tab have dropdowns. Rows missing from an older sheet are added by the next sync.
+
+| Setting | Values | Default |
+|---|---|---|
+| `sync_every` | `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `daily` | `1h` |
+| `sync_hour` | `0`–`23`, the hour a `daily` sync runs (Settings `timezone`; Google picks a minute within that hour) | `6` |
+| `row_order_orders`, `row_order_drafts`, `row_order_abandoned` | see below | `top` |
+
+A new `sync_every` takes effect at the next sync, or immediately with **Re-install trigger**. If a sync has more to fetch than fits in one run, it continues by itself a minute later.
+
+| Row order | New rows go… |
+|---|---|
+| `top` | at the top (row 2), newest first. Existing rows never move. An older order fetched later (e.g. by Backfill) can land above newer ones. |
+| `sorted` | where their date belongs, assuming the tab is sorted newest first. If you sorted it another way they still go in, just not in a meaningful place. |
+| `resort` | at the bottom, then the whole tab is re-sorted newest first, but only on syncs that added rows. Undoes any custom sort you made. |
+| `bottom` | at the bottom (the behaviour before 3.2.0). |
+
+**Upgrading from 3.1.** Paste the new `Code.gs` **and** `appsscript.json`, then run `setup` once from the editor and approve the new permission (it lets the script see who installed the trigger). Until you approve it, scheduled syncs fail. Then use **Sort newest first** once so existing rows match the new order.
+
+**More than one editor.** Each person who runs setup or Re-install trigger gets their own trigger, so syncs would run twice. The script remembers who installed the schedule and warns anyone else before they add a second one.
 
 The `Log` tab records each run. A failure also emails `ALERT_EMAIL`, at most once per hour per kind of error.
 
@@ -97,7 +123,8 @@ The `Log` tab records each run. A failure also emails `ALERT_EMAIL`, at most onc
 | `ACCESS_DENIED` mentioning a scope | Add the missing scope in the app (`read_orders`, `read_customers`, `read_draft_orders`), release a new version, and reinstall |
 | `abandoned checkouts query` fails | Check both scopes. If Shopify still asks for it, add `read_checkouts`. The newest docs also mention an abandoned-checkout permission for staff users; the first call tells you whether it applies to the app |
 | `"Orders" tab not found` (or Drafts / Abandoned checkouts) | Run `setup()` |
-| Nothing new appears | Check **Triggers** (clock icon in Apps Script) for a `syncAll` trigger; use *Re-install trigger* |
+| Nothing new appears | Check **Triggers** (clock icon in Apps Script) for a `syncAll` trigger; use *Re-install trigger*. Also check `sync_every`: with `daily` new orders only appear once a day |
+| `Authorization is required` in trigger failure emails | The new permission from 3.2.0 was not approved yet. Run `setup` once from the editor |
 
 ## Tests
 
@@ -107,4 +134,4 @@ The `Log` tab records each run. A failure also emails `ALERT_EMAIL`, at most onc
 node test_code.js
 ```
 
-It covers phone formatting, building order/draft/checkout rows, header matching, Remarks surviving sorting, never overwriting the recovered Order #, the Drafts sync, recovered-order matching, token refresh on 401, throttle handling, and resuming a paged fetch. It cannot test real Shopify responses; Gate 0 and the first real order are the true end-to-end checks.
+It covers phone formatting, building order/draft/checkout rows, header matching, Remarks surviving sorting, never overwriting the recovered Order #, the Drafts sync, the four row orders, settings migration, trigger schedules, resuming a sync that ran out of time, recovered-order matching, token refresh on 401, throttle handling, and resuming a paged fetch. It cannot test real Shopify responses; Gate 0 and the first real order are the true end-to-end checks.

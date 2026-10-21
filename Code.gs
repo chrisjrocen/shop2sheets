@@ -45,7 +45,27 @@ const SETTINGS_DEFAULTS = {
   price_format: '#,##0',
   overlap_minutes: '10',
   backfill_days: '60',
-  alert_throttle_minutes: '60'
+  alert_throttle_minutes: '60',
+  sync_every: '1h',
+  sync_hour: '6',
+  row_order_orders: 'top',
+  row_order_drafts: 'top',
+  row_order_abandoned: 'top'
+};
+
+// Where new rows go: top (row 2, newest first), sorted (by date), resort (append, then sort the tab), bottom.
+const ROW_ORDERS = ['top', 'sorted', 'resort', 'bottom'];
+// Every interval an Apps Script time trigger supports. `daily` runs at Settings > sync_hour.
+const SYNC_EVERY = ['5m', '10m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', 'daily'];
+const SYNC_HOURS = Array.from({ length: 24 }, function (_, h) { return String(h); });
+
+// Settings that get a dropdown in the Settings tab.
+const SETTING_CHOICES = {
+  sync_every: SYNC_EVERY,
+  sync_hour: SYNC_HOURS,
+  row_order_orders: ROW_ORDERS,
+  row_order_drafts: ROW_ORDERS,
+  row_order_abandoned: ROW_ORDERS
 };
 
 /* ------------------------------------------------------------------ */
@@ -220,7 +240,40 @@ function getSettings_() {
   cfg.overlap_minutes = Number(cfg.overlap_minutes) || 10;
   cfg.backfill_days = Number(cfg.backfill_days) || 60;
   cfg.alert_throttle_minutes = Number(cfg.alert_throttle_minutes) || 60;
+  ['row_order_orders', 'row_order_drafts', 'row_order_abandoned'].forEach(function (k) {
+    if (ROW_ORDERS.indexOf(cfg[k]) === -1) cfg[k] = 'top';
+  });
+  if (SYNC_EVERY.indexOf(cfg.sync_every) === -1) cfg.sync_every = '1h';
+  const hour = parseInt(cfg.sync_hour, 10);
+  cfg.sync_hour = hour >= 0 && hour <= 23 ? hour : 6;
+  const n = parseInt(cfg.sync_every, 10);
+  cfg.sync_interval_ms = cfg.sync_every === 'daily' ? 86400000 : n * (/h$/.test(cfg.sync_every) ? 3600000 : 60000);
+  cfg.schedule_id = cfg.sync_every === 'daily' ? 'daily@' + cfg.sync_hour : cfg.sync_every;
   return cfg;
+}
+
+/** Creates the Settings tab if needed and appends any missing settings (with dropdowns). Never changes existing values. */
+function ensureSettings_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Settings');
+  if (!sh) {
+    sh = ss.insertSheet('Settings');
+    sh.setColumnWidth(1, 200);
+  }
+  const last = sh.getLastRow();
+  const have = last ? sh.getRange(1, 1, last, 1).getValues().map(function (r) { return String(r[0]).trim(); }) : [];
+  const missing = Object.keys(SETTINGS_DEFAULTS).filter(function (k) { return have.indexOf(k) === -1; });
+  if (!missing.length) return;
+  const rows = missing.map(function (k) { return [k, SETTINGS_DEFAULTS[k]]; });
+  const range = sh.getRange(last + 1, 1, rows.length, 2);
+  range.setNumberFormat('@');
+  range.setValues(rows);
+  missing.forEach(function (k, i) {
+    if (!SETTING_CHOICES[k]) return;
+    const rule = SpreadsheetApp.newDataValidation().requireValueInList(SETTING_CHOICES[k], true).setAllowInvalid(false).build();
+    sh.getRange(last + 1 + i, 2).setDataValidation(rule);
+  });
+  if (last) log_('setup', 'Added settings: ' + missing.join(', '));
 }
 
 function log_(type, message) {
@@ -466,9 +519,12 @@ function ensureOwnerColumns_(sheet, layout) {
  * Inserts or updates records (objects keyed by header) in a sheet.
  * Rows are found by key value, so the owner can sort, filter, or insert rows freely.
  * Only managed columns are written; a value of undefined leaves the cell alone.
+ * opts = { mode, dateHeader, cfg } decides where new rows go (see ROW_ORDERS); default bottom.
  */
-function upsert_(sheet, headers, keyHeader, records) {
-  if (!records.length) return { added: 0, updated: 0 };
+function upsert_(sheet, headers, keyHeader, records, opts) {
+  opts = opts || {};
+  const mode = opts.mode || 'bottom';
+  if (!records.length) return { added: 0, updated: 0, insertedAtTop: false };
   const colMap = ensureHeaders_(sheet, headers);
   const keyCol = colMap[keyHeader];
   const lastRow = Math.max(sheet.getLastRow(), 1);
@@ -509,30 +565,90 @@ function upsert_(sheet, headers, keyHeader, records) {
     updatedRows = Object.keys(touched).length;
   }
 
+  let insertedAtTop = false;
   if (appends.length) {
     const maxCol = Math.max.apply(null, headers.map(function (h) { return colMap[h]; }));
-    const rows = appends.map(function (rec) {
+    const toRow = function (rec) {
       const row = new Array(maxCol).fill('');
       headers.forEach(function (h) { if (rec[h] !== undefined) row[colMap[h] - 1] = rec[h]; });
       return row;
-    });
-    const start = lastRow + 1;
-    const need = start + rows.length - 1 - sheet.getMaxRows();
-    if (need > 0) sheet.insertRowsAfter(sheet.getMaxRows(), need + 100);
-    sheet.getRange(start, 1, rows.length, maxCol).setValues(rows);
+    };
+    if (mode === 'top' || mode === 'sorted') {
+      appends.sort(function (a, b) { return newestFirst_(a[opts.dateHeader], b[opts.dateHeader], a[keyHeader], b[keyHeader]); });
+      // Each group of records goes in above `pos` (lastRow + 1 means after the last row).
+      const groups = [];
+      if (mode === 'top' || lastRow < 2) {
+        groups.push({ pos: 2, recs: appends });
+      } else {
+        const dates = sheet.getRange(2, colMap[opts.dateHeader], lastRow - 1, 1).getValues();
+        appends.forEach(function (rec) {
+          let pos = lastRow + 1;
+          for (let i = 0; i < dates.length; i++) {
+            const d = dates[i][0];
+            if (!(d instanceof Date) || newestFirst_(rec[opts.dateHeader], d, rec[keyHeader], '') < 0) { pos = i + 2; break; }
+          }
+          const g = groups[groups.length - 1];
+          if (g && g.pos === pos) g.recs.push(rec); else groups.push({ pos: pos, recs: [rec] });
+        });
+      }
+      // Bottom-up, so inserting one group never shifts the position of another.
+      groups.sort(function (a, b) { return b.pos - a.pos; }).forEach(function (g) {
+        const n = g.recs.length;
+        if (g.pos === 2) { sheet.insertRowsAfter(1, n); insertedAtTop = true; }
+        else if (g.pos > lastRow) sheet.insertRowsAfter(lastRow, n);
+        else sheet.insertRowsBefore(g.pos, n);
+        sheet.getRange(g.pos, 1, n, maxCol).setValues(g.recs.map(toRow));
+        formatRows_(sheet, colMap, headers, g.pos, n, opts.cfg);
+      });
+    } else {
+      const rows = appends.map(toRow);
+      const start = lastRow + 1;
+      const need = start + rows.length - 1 - sheet.getMaxRows();
+      if (need > 0) sheet.insertRowsAfter(sheet.getMaxRows(), need + 100);
+      sheet.getRange(start, 1, rows.length, maxCol).setValues(rows);
+    }
   }
-  return { added: appends.length, updated: updatedRows };
+  return { added: appends.length, updated: updatedRows, insertedAtTop: insertedAtTop };
+}
+
+/** Comparator: newer date first, then higher ID; rows without a date go last. */
+function newestFirst_(dateA, dateB, keyA, keyB) {
+  const ta = dateA instanceof Date ? dateA.getTime() : -Infinity;
+  const tb = dateB instanceof Date ? dateB.getTime() : -Infinity;
+  if (ta !== tb) return tb > ta ? 1 : -1;
+  const na = Number(keyA), nb = Number(keyB);
+  if (!isNaN(na) && !isNaN(nb) && na !== nb) return nb - na;
+  return String(keyB).localeCompare(String(keyA));
+}
+
+/** Sorts a tab by its date column, newest first. All columns move, so Remarks stay with their rows. */
+function sortByDate_(sheet, src) {
+  const last = sheet.getLastRow();
+  if (last < 3) return;
+  const colMap = ensureHeaders_(sheet, src.headers);
+  sheet.getRange(2, 1, last - 1, sheet.getLastColumn()).sort([
+    { column: colMap[src.dateHeader], ascending: false },
+    { column: colMap[KEY_HEADER], ascending: false }
+  ]);
+}
+
+function formatFor_(header, cfg) {
+  if (DATE_COLS.indexOf(header) !== -1) return 'yyyy-mm-dd hh:mm';
+  if (MONEY_COLS.indexOf(header) !== -1) return (cfg && cfg.price_format) || SETTINGS_DEFAULTS.price_format;
+  return '@';
+}
+
+/** Inserted rows can inherit the header's bold/grey styling; reset them to plain data rows. */
+function formatRows_(sheet, colMap, headers, startRow, n, cfg) {
+  sheet.getRange(startRow, 1, n, sheet.getLastColumn()).setFontWeight('normal').setBackground(null);
+  headers.forEach(function (h) { sheet.getRange(startRow, colMap[h], n, 1).setNumberFormat(formatFor_(h, cfg)); });
 }
 
 function applyFormats_(sheet, headers, layout, cfg) {
   const colMap = ensureHeaders_(sheet, headers, layout);
   const rows = sheet.getMaxRows();
   headers.forEach(function (h) {
-    const range = sheet.getRange(1, colMap[h], rows, 1);
-    let fmt = '@';
-    if (DATE_COLS.indexOf(h) !== -1) fmt = 'yyyy-mm-dd hh:mm';
-    else if (MONEY_COLS.indexOf(h) !== -1) fmt = cfg.price_format;
-    range.setNumberFormat(fmt);
+    sheet.getRange(1, colMap[h], rows, 1).setNumberFormat(formatFor_(h, cfg));
   });
   const lastCol = Math.max(sheet.getLastColumn(), layout.length);
   sheet.getRange(1, 1, 1, lastCol).setFontWeight('bold').setBackground('#f1f3f4');
@@ -553,10 +669,14 @@ const DRAFT_SPEC = { query: DRAFTS_QUERY, root: 'draftOrders' };
 const ABANDONED_SPEC = { query: ABANDONED_QUERY, root: 'abandonedCheckouts' };
 
 const SOURCES = [
-  { key: 'orders', sheet: SHEET_ORDERS, headers: ORDER_HEADERS, spec: ORDER_SPEC, cursor: 'ORDERS_CURSOR', extra: 'test:false', toRecord: orderToRecord_ },
-  { key: 'drafts', sheet: SHEET_DRAFTS, headers: DRAFT_HEADERS, spec: DRAFT_SPEC, cursor: 'DRAFTS_CURSOR', extra: '', toRecord: draftToRecord_ },
-  { key: 'abandoned', sheet: SHEET_ABANDONED, headers: ABANDONED_HEADERS, spec: ABANDONED_SPEC, cursor: 'ABANDONED_CURSOR', extra: '', toRecord: checkoutToRecord_ }
+  { key: 'orders', sheet: SHEET_ORDERS, layout: ORDER_LAYOUT, headers: ORDER_HEADERS, spec: ORDER_SPEC, cursor: 'ORDERS_CURSOR', extra: 'test:false', toRecord: orderToRecord_,
+    dateHeader: 'Date placed', orderSetting: 'row_order_orders', ruleHeader: 'Status', ruleValue: 'Cancelled' },
+  { key: 'drafts', sheet: SHEET_DRAFTS, layout: DRAFT_LAYOUT, headers: DRAFT_HEADERS, spec: DRAFT_SPEC, cursor: 'DRAFTS_CURSOR', extra: '', toRecord: draftToRecord_,
+    dateHeader: 'Date created', orderSetting: 'row_order_drafts', ruleHeader: 'Status', ruleValue: 'Completed' },
+  { key: 'abandoned', sheet: SHEET_ABANDONED, layout: ABANDONED_LAYOUT, headers: ABANDONED_HEADERS, spec: ABANDONED_SPEC, cursor: 'ABANDONED_CURSOR', extra: '', toRecord: checkoutToRecord_,
+    dateHeader: 'Date started', orderSetting: 'row_order_abandoned', ruleHeader: 'Status', ruleValue: 'Recovered' }
 ];
+const ROW_RULE_COLOR = '#e0e0e0';
 
 /**
  * Pages through a connection, calling onBatch(nodes) for every ~100 nodes.
@@ -590,12 +710,18 @@ function syncSource_(src, cfg, sinceDate, after, deadline) {
   const sheet = getSheet_(src.sheet);
   if (!sheet) throw new Error('"' + src.sheet + '" tab not found. Run setup() first.');
   const stats = { added: 0, updated: 0 };
+  const mode = cfg[src.orderSetting] || 'bottom';
+  let insertedAtTop = false;
   const q = "updated_at:>='" + isoNoMs_(sinceDate) + "'" + (src.extra ? ' ' + src.extra : '');
   const res = fetchPaged_(src.spec, q, after, deadline, function (nodes) {
     const recs = nodes.map(function (n) { return src.toRecord(n, cfg); }).filter(Boolean);
-    const r = upsert_(sheet, src.headers, KEY_HEADER, recs);
+    const r = upsert_(sheet, src.headers, KEY_HEADER, recs, { mode: mode, dateHeader: src.dateHeader, cfg: cfg });
     stats.added += r.added; stats.updated += r.updated;
+    if (r.insertedAtTop) insertedAtTop = true;
   });
+  // Rows inserted above row 2 push the grey status rule down; re-anchor it at row 2.
+  if (insertedAtTop) addRowRule_(sheet, src.headers, src.ruleHeader, src.ruleValue, ROW_RULE_COLOR);
+  if (mode === 'resort' && stats.added > 0) sortByDate_(sheet, src);
   return { res: res, stats: stats };
 }
 
@@ -656,7 +782,9 @@ function resolveRecovered_(cfg, deadline) {
       sheet.getRange(i + 2, colMap['Order #']).setValue(match.name + (match.method === 'token' ? '' : ' (guess)'));
     } else {
       const at = row[colMap['Recovered at'] - 1];
-      const recent = at instanceof Date && Date.now() - at.getTime() < 30 * 60000;
+      // Give every recovery at least one retry before giving up, however long the sync interval is.
+      const wait = Math.max(30 * 60000, 2 * (cfg.sync_interval_ms || 0));
+      const recent = at instanceof Date && Date.now() - at.getTime() < wait;
       if (!recent) sheet.getRange(i + 2, colMap['Order #']).setValue('no match');
     }
   }
@@ -667,7 +795,7 @@ function resolveRecovered_(cfg, deadline) {
 /* Entry points                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Runs every 5 minutes (time-driven trigger). */
+/** Runs on the schedule in Settings > sync_every (time-driven trigger). */
 function syncAll() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) { log_('skip', 'Another run is still active.'); return; }
@@ -687,7 +815,14 @@ function handleError_(e, context) {
   try { sendAlert_(e); } catch (mailErr) { log_('error', 'alert failed: ' + mailErr); }
 }
 
+/** Target of the one-off trigger set when a sync runs out of time. */
+function continueSync() {
+  removeTriggers_('continueSync');
+  syncAll();
+}
+
 function runSync_() {
+  ensureSettings_();
   const cfg = getSettings_();
   const startedAt = new Date();
   const deadline = Date.now() + RUN_BUDGET_MS;
@@ -695,19 +830,45 @@ function runSync_() {
   const errors = [];
   const summary = [];
   const defaultSince = new Date(Date.now() - cfg.backfill_days * 86400000);
+  let unfinished = false;
+
+  // Apply a changed Settings > sync_every. Only the trigger's owner may, or a second trigger would appear.
+  const owner = getProp_('TRIGGER_OWNER');
+  if (getProp_('SYNC_SCHEDULE') !== cfg.schedule_id && (!owner || owner === currentUser_())) {
+    try { installTrigger_(cfg); } catch (e) { errors.push('trigger: ' + (e && e.message ? e.message : e)); }
+  }
 
   SOURCES.forEach(function (src) {
+    // A run that ran out of time saved its page cursor; resume the same query from there.
+    const pending = getProp_(src.cursor + '_AFTER');
     try {
-      const saved = getProp_(src.cursor);
-      const since = new Date((saved ? new Date(saved) : defaultSince).getTime() - overlap);
-      const out = syncSource_(src, cfg, since, null, deadline);
-      if (out.res.done) setProp_(src.cursor, startedAt.toISOString());
-      else log_('warn', src.key + ': time budget reached, will continue next run.');
+      let since, started;
+      if (pending) {
+        since = new Date(getProp_(src.cursor + '_SINCE'));
+        started = getProp_(src.cursor + '_STARTED') || startedAt.toISOString();
+      } else {
+        const saved = getProp_(src.cursor);
+        since = new Date((saved ? new Date(saved) : defaultSince).getTime() - overlap);
+        started = startedAt.toISOString();
+      }
+      const out = syncSource_(src, cfg, since, pending || null, deadline);
+      if (out.res.done) {
+        setProp_(src.cursor, started);
+        clearSyncResume_(src);
+      } else {
+        setProp_(src.cursor + '_AFTER', out.res.after);
+        setProp_(src.cursor + '_SINCE', since.toISOString());
+        setProp_(src.cursor + '_STARTED', started);
+        unfinished = true;
+        log_('warn', src.key + ': time budget reached, continuing in about a minute.');
+      }
       summary.push(src.key + ' +' + out.stats.added + ' ~' + out.stats.updated);
     } catch (e) {
+      if (pending) clearSyncResume_(src); // a stale page cursor must not block every later run
       errors.push(src.key + ': ' + (e && e.message ? e.message : e));
     }
   });
+  if (unfinished) scheduleSyncContinuation_();
 
   try {
     const n = resolveRecovered_(cfg, deadline);
@@ -732,6 +893,7 @@ function backfill(days) {
     setProp_('BF_STAGE', 'running');
     setProp_('BF_INDEX', '0');
     delProp_('BF_AFTER');
+    SOURCES.forEach(clearSyncResume_); // backfill re-reads everything and resets the cursors
     log_('backfill', 'Started: last ' + n + ' days.');
     continueBackfillLocked_();
   } catch (e) {
@@ -794,16 +956,80 @@ function scheduleBackfillContinuation_() {
   ScriptApp.newTrigger('continueBackfill').timeBased().after(60 * 1000).create();
 }
 
+function clearSyncResume_(src) {
+  ['_AFTER', '_SINCE', '_STARTED'].forEach(function (s) { delProp_(src.cursor + s); });
+}
+
+function scheduleSyncContinuation_() {
+  removeTriggers_('continueSync');
+  ScriptApp.newTrigger('continueSync').timeBased().after(60 * 1000).create();
+}
+
 function removeTriggers_(handler) {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === handler) ScriptApp.deleteTrigger(t);
   });
 }
 
-function installTrigger() {
+function currentUser_() {
+  try { return Session.getEffectiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+
+function describeSchedule_(cfg) {
+  if (cfg.sync_every === 'daily') return 'daily at ' + cfg.sync_hour + ':00 (' + cfg.timezone + ')';
+  const n = parseInt(cfg.sync_every, 10);
+  return /h$/.test(cfg.sync_every) ? 'every ' + n + (n === 1 ? ' hour' : ' hours') : 'every ' + n + ' minutes';
+}
+
+/** Replaces the current user's sync trigger with one matching Settings > sync_every / sync_hour. */
+function installTrigger_(cfg) {
   removeTriggers_('syncAll');
-  ScriptApp.newTrigger('syncAll').timeBased().everyMinutes(5).create();
-  log_('setup', 'Installed 5-minute trigger.');
+  const n = parseInt(cfg.sync_every, 10);
+  const b = ScriptApp.newTrigger('syncAll').timeBased();
+  // The manifest timezone is fixed, so the daily hour is pinned to the Settings timezone explicitly.
+  if (cfg.sync_every === 'daily') b.everyDays(1).atHour(cfg.sync_hour).inTimezone(cfg.timezone).create();
+  else if (/h$/.test(cfg.sync_every)) b.everyHours(n).create();
+  else b.everyMinutes(n).create();
+  setProp_('SYNC_SCHEDULE', cfg.schedule_id);
+  setProp_('TRIGGER_OWNER', currentUser_());
+  log_('setup', 'Installed sync trigger: ' + describeSchedule_(cfg) + '.');
+}
+
+/**
+ * Triggers belong to whoever installs them, and a script cannot delete another user's trigger.
+ * Returns false if someone else owns the schedule and the current user declines to add a second one.
+ */
+function confirmTriggerOwner_() {
+  const owner = getProp_('TRIGGER_OWNER');
+  const me = currentUser_();
+  if (!owner || !me || owner === me) return true;
+  const text = 'The sync schedule was installed by ' + owner + '. Installing yours too makes every sync run twice.';
+  let ui;
+  try { ui = SpreadsheetApp.getUi(); } catch (e) {
+    // Run from the script editor: no dialog possible, so proceed and leave a note.
+    log_('warn', text + ' Ask ' + owner + ' to use Shopify Sync > Remove my trigger.');
+    return true;
+  }
+  return ui.alert('Sync schedule', text + '\n\nContinue? Afterwards ask ' + owner +
+    ' to use Shopify Sync > Remove my trigger (or delete it in Apps Script > Triggers).',
+    ui.ButtonSet.YES_NO) === ui.Button.YES;
+}
+
+/** Menu: applies Settings > sync_every now instead of on the next run. */
+function installTrigger() {
+  ensureSettings_();
+  const cfg = getSettings_();
+  if (!confirmTriggerOwner_()) return;
+  installTrigger_(cfg);
+  notify_('Sync schedule', 'Syncing ' + describeSchedule_(cfg) + '.');
+}
+
+/** Menu: removes the current user's sync trigger (only your own; Google does not allow removing someone else's). */
+function removeMyTrigger() {
+  removeTriggers_('syncAll');
+  removeTriggers_('continueSync');
+  if (getProp_('TRIGGER_OWNER') === currentUser_()) delProp_('TRIGGER_OWNER');
+  notify_('Sync schedule', 'Your sync trigger was removed. Use Re-install trigger to sync on a schedule again.');
 }
 
 /* ------------------------------------------------------------------ */
@@ -814,29 +1040,17 @@ function setup() {
   const ss = SpreadsheetApp.getActive();
   const missing = ['SHOPIFY_STORE', 'CLIENT_ID', 'CLIENT_SECRET', 'ALERT_EMAIL'].filter(function (k) { return !getProp_(k); });
 
-  let settings = ss.getSheetByName('Settings');
-  if (!settings) {
-    settings = ss.insertSheet('Settings');
-    const rows = Object.keys(SETTINGS_DEFAULTS).map(function (k) { return [k, SETTINGS_DEFAULTS[k]]; });
-    settings.getRange(1, 1, rows.length, 2).setValues(rows);
-    settings.getRange(1, 1, rows.length, 2).setNumberFormat('@');
-    settings.setColumnWidth(1, 200);
-  }
+  ensureSettings_();
   const cfg = getSettings_();
   ss.setSpreadsheetTimeZone(cfg.timezone);
 
   const firstSheet = ss.getSheets()[0];
-  const plan = [
-    { name: SHEET_ORDERS, layout: ORDER_LAYOUT, headers: ORDER_HEADERS, ruleHeader: 'Status', ruleValue: 'Cancelled' },
-    { name: SHEET_DRAFTS, layout: DRAFT_LAYOUT, headers: DRAFT_HEADERS, ruleHeader: 'Status', ruleValue: 'Completed' },
-    { name: SHEET_ABANDONED, layout: ABANDONED_LAYOUT, headers: ABANDONED_HEADERS, ruleHeader: 'Status', ruleValue: 'Recovered' }
-  ];
-  plan.forEach(function (p, i) {
-    let sheet = ss.getSheetByName(p.name);
+  SOURCES.forEach(function (p, i) {
+    let sheet = ss.getSheetByName(p.sheet);
     if (!sheet) {
       // Reuse an untouched default sheet instead of leaving an empty "Sheet1" behind.
-      if (i === 0 && firstSheet.getName() === 'Sheet1' && firstSheet.getLastRow() === 0) { sheet = firstSheet; sheet.setName(p.name); }
-      else sheet = ss.insertSheet(p.name);
+      if (i === 0 && firstSheet.getName() === 'Sheet1' && firstSheet.getLastRow() === 0) { sheet = firstSheet; sheet.setName(p.sheet); }
+      else sheet = ss.insertSheet(p.sheet);
     }
     ensureHeaders_(sheet, p.headers, p.layout);
     ensureOwnerColumns_(sheet, p.layout);
@@ -844,14 +1058,18 @@ function setup() {
     try {
       if (!sheet.getFilter()) sheet.getRange(1, 1, sheet.getMaxRows(), Math.max(sheet.getLastColumn(), p.layout.length)).createFilter();
     } catch (e) { /* filter is optional */ }
-    addRowRule_(sheet, p.headers, p.ruleHeader, p.ruleValue, '#e0e0e0');
+    addRowRule_(sheet, p.headers, p.ruleHeader, p.ruleValue, ROW_RULE_COLOR);
   });
   if (!ss.getSheetByName('Log')) log_('setup', 'Created.');
-  installTrigger();
+  const installed = confirmTriggerOwner_();
+  if (installed) installTrigger_(cfg);
 
+  const ready = installed
+    ? 'Tabs are ready; syncing ' + describeSchedule_(cfg) + ' (change it in Settings > sync_every).'
+    : 'Tabs are ready; the sync schedule was left with ' + getProp_('TRIGGER_OWNER') + '.';
   const msg = missing.length
-    ? 'Tabs and trigger are ready, but these Script Properties are still missing: ' + missing.join(', ') + '.\n\nAdd them in Project Settings, then run Test access.'
-    : 'Tabs and trigger are ready.\n\nNext: run Shopify Sync > Test access, then Shopify Sync > Backfill.';
+    ? ready + '\n\nThese Script Properties are still missing: ' + missing.join(', ') + '.\n\nAdd them in Project Settings, then run Test access.'
+    : ready + '\n\nNext: run Shopify Sync > Test access, then Shopify Sync > Backfill.';
   notify_('Setup finished', msg);
 }
 
@@ -864,9 +1082,11 @@ function addRowRule_(sheet, headers, header, value, color) {
     .setBackground(color)
     .setRanges([sheet.getRange(2, 1, sheet.getMaxRows() - 1, lastCol)])
     .build();
+  // Also drops our own rule after inserted rows shifted it to start below row 2 (=$H5="Cancelled").
+  const shifted = new RegExp('^=\\$' + colLetter_(col) + '\\d+="' + value + '"$');
   const rules = sheet.getConditionalFormatRules().filter(function (r) {
     const c = r.getBooleanCondition();
-    return !(c && c.getCriteriaValues && String(c.getCriteriaValues()[0]) === formula);
+    return !(c && c.getCriteriaValues && shifted.test(String(c.getCriteriaValues()[0])));
   });
   rules.push(rule);
   sheet.setConditionalFormatRules(rules);
@@ -883,9 +1103,28 @@ function onOpen() {
     .addItem('Sync now', 'syncNowMenu_')
     .addItem('Backfill...', 'backfillPrompt_')
     .addItem('Test access (Gate 0)', 'testAccess')
+    .addItem('Sort newest first', 'sortNewestFirstMenu_')
     .addItem('Show last error', 'showLastError')
     .addItem('Re-install trigger', 'installTrigger')
+    .addItem('Remove my trigger', 'removeMyTrigger')
     .addToUi();
+}
+
+/** Menu: one-time sort of every tab by date, newest first. */
+function sortNewestFirstMenu_() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert('Sort newest first',
+    'Sorts Orders, Drafts and Abandoned checkouts by date, newest first. Remarks move with their rows. Continue?',
+    ui.ButtonSet.YES_NO);
+  if (ok !== ui.Button.YES) return;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) { notify_('Sort newest first', 'A sync is running; try again in a minute.'); return; }
+  try {
+    SOURCES.forEach(function (src) { const sh = getSheet_(src.sheet); if (sh) sortByDate_(sh, src); });
+  } finally {
+    lock.releaseLock();
+  }
+  notify_('Sort newest first', 'Done.');
 }
 
 function syncNowMenu_() { syncAll(); notify_('Sync', 'Finished. See the Log tab for details.'); }
