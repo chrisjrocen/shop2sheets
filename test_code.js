@@ -10,14 +10,35 @@ class FakeSheet {
   getLastRow() { let last = 0; this.data.forEach((row, i) => { if (row.some(v => v !== '' && v !== undefined)) last = i + 1; }); return last; }
   getLastColumn() { let last = 0; this.data.forEach(row => row.forEach((v, i) => { if (v !== '' && v !== undefined) last = Math.max(last, i + 1); })); return last; }
   getMaxRows() { return this.maxRows; }
-  insertRowsAfter(_after, n) { this.maxRows += n; }
+  insertRowsAfter(after, n) { if (after < this.data.length) this.data.splice(after, 0, ...Array.from({ length: n }, () => [])); this.maxRows += n; }
+  insertRowsBefore(row, n) { this.insertRowsAfter(row - 1, n); }
+  appendRow(vals) { this.data.splice(this.getLastRow(), 0, vals.slice()); }
+  setFrozenRows() {} setColumnWidth() {} deleteRows() {}
+  getConditionalFormatRules() { return this.rules || []; }
+  setConditionalFormatRules(r) { this.rules = r; }
   insertColumnAfter(col) { this.data.forEach(row => { while (row.length < col) row.push(''); row.splice(col, 0, ''); }); }
   getRange(r, c, nr = 1, nc = 1) {
     const s = this;
     return {
       getValues() { const out = []; for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) row.push(s._cell(r + i, c + j)); out.push(row); } return out; },
       setValues(vals) { vals.forEach((row, i) => row.forEach((v, j) => s._set(r + i, c + j, v))); return this; },
-      setValue(v) { s._set(r, c, v); return this; }
+      setValue(v) { s._set(r, c, v); return this; },
+      setNumberFormat() { return this; }, setFontWeight() { return this; }, setBackground() { return this; },
+      setDataValidation(v) { s.validation = s.validation || {}; s.validation[r] = v; return this; },
+      sort(specs) {
+        const key = v => v instanceof Date ? v.getTime() : (v === '' || v === undefined ? null : v);
+        const rows = this.getValues();
+        rows.sort((a, b) => {
+          for (const sp of specs) {
+            const x = key(a[sp.column - c]), y = key(b[sp.column - c]);
+            if (x === y) continue;
+            if (x === null) return 1; if (y === null) return -1; // blanks last
+            return (x < y ? -1 : 1) * (sp.ascending ? 1 : -1);
+          }
+          return 0;
+        });
+        this.setValues(rows); s.sorted = (s.sorted || 0) + 1; return this;
+      }
     };
   }
 }
@@ -29,7 +50,22 @@ const ctx = {
   console, Date, JSON, Math, Object, Array, String, Number, Error, isNaN,
   PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] === undefined ? null : props[k], setProperty: (k, v) => { props[k] = v; }, deleteProperty: k => { delete props[k]; } }) },
   Utilities: { sleep() {} },
-  SpreadsheetApp: { getActive: () => ({ getSheetByName: n => sheets[n] || null, insertSheet: () => ({ appendRow() {}, setFrozenRows() {}, getLastRow: () => 0, deleteRows() {} }) }) },
+  SpreadsheetApp: {
+    getActive: () => ({ getSheetByName: n => sheets[n] || null, insertSheet: n => (sheets[n] = new FakeSheet()) }),
+    newConditionalFormatRule: () => { const rule = {}; const b = { whenFormulaSatisfied: f => { rule.f = f; return b; }, setBackground: () => b, setRanges: () => b, build: () => ({ getBooleanCondition: () => ({ getCriteriaValues: () => [rule.f] }) }) }; return b; },
+    newDataValidation: () => { const v = {}; const b = { requireValueInList: l => { v.list = l; return b; }, setAllowInvalid: () => b, build: () => v }; return b; }
+  },
+  Session: { getEffectiveUser: () => ({ getEmail: () => ctx.__user || '' }) },
+  ScriptApp: {
+    triggers: [],
+    getProjectTriggers() { return this.triggers; },
+    deleteTrigger(t) { this.triggers = this.triggers.filter(x => x !== t); },
+    newTrigger(handler) {
+      const calls = [];
+      const b = new Proxy({}, { get: (_, m) => m === 'create' ? () => { ctx.ScriptApp.triggers.push({ handler, calls, getHandlerFunction: () => handler }); } : (...a) => { calls.push([m, ...a]); return b; } });
+      return b;
+    }
+  },
   UrlFetchApp: { fetch: (...a) => ctx.__fetch(...a) }
 };
 vm.createContext(ctx);
@@ -250,6 +286,155 @@ test('resolveRecovered_: token, guess, no match', () => {
   assert.strictEqual(sh._cell(2, m['Order #']), '#2001');
   assert.strictEqual(sh._cell(3, m['Order #']), '#2002 (guess)');
   assert.strictEqual(sh._cell(4, m['Order #']), 'no match');
+});
+
+const ID = ORDER_LAYOUT.indexOf('Shopify ID'), REM = ORDER_LAYOUT.indexOf('Remarks');
+const mkOrder = (id, iso) => call('orderToRecord_', Object.assign({}, order, { legacyResourceId: String(id), name: '#' + id, createdAt: iso }), cfg);
+const ids = sh => sh.data.slice(1, sh.getLastRow()).map(r => r[ID]);
+test('upsert_ top: new rows at row 2 newest first, Remarks stay with their rows', () => {
+  const sh = new FakeSheet();
+  call('ensureHeaders_', sh, ORDER_HEADERS, ORDER_LAYOUT);
+  const opts = { mode: 'top', dateHeader: 'Date placed', cfg };
+  call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(1, '2026-10-01T00:00:00Z'), mkOrder(2, '2026-10-02T00:00:00Z')], opts);
+  assert.deepStrictEqual(ids(sh), ['2', '1']);
+  sh._set(3, REM + 1, 'note on 1');
+  const paid = Object.assign(mkOrder(1, '2026-10-01T00:00:00Z'), { Status: 'Paid' });
+  const r = call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(3, '2026-10-03T00:00:00Z'), paid, mkOrder(4, '2026-10-04T00:00:00Z')], opts);
+  assert.deepStrictEqual([r.added, r.updated, r.insertedAtTop], [2, 1, true]);
+  assert.deepStrictEqual(ids(sh), ['4', '3', '2', '1']);
+  assert.strictEqual(sh._cell(5, REM + 1), 'note on 1');
+  assert.strictEqual(sh._cell(5, ORDER_LAYOUT.indexOf('Status') + 1), 'Paid');
+});
+test('upsert_ sorted: rows interleave by date, bottom-up inserts, blanks last', () => {
+  const sh = new FakeSheet();
+  call('ensureHeaders_', sh, ORDER_HEADERS, ORDER_LAYOUT);
+  const opts = { mode: 'sorted', dateHeader: 'Date placed', cfg };
+  call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(10, '2026-10-10T00:00:00Z'), mkOrder(5, '2026-10-05T00:00:00Z'), mkOrder(1, '2026-10-01T00:00:00Z')], opts);
+  assert.deepStrictEqual(ids(sh), ['10', '5', '1']);
+  sh._set(3, REM + 1, 'five');
+  const r = call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(3, '2026-10-03T00:00:00Z'), mkOrder(12, '2026-10-12T00:00:00Z'), mkOrder(0, '2026-09-30T00:00:00Z'), mkOrder(7, '2026-10-07T00:00:00Z'), mkOrder(6, '2026-10-06T00:00:00Z')], opts);
+  assert.strictEqual(r.insertedAtTop, true);
+  assert.deepStrictEqual(ids(sh), ['12', '10', '7', '6', '5', '3', '1', '0']);
+  assert.strictEqual(sh.data.find(x => x[ID] === '5')[REM], 'five');
+  // a row with no date: new rows go above it
+  sh._set(10, 1, ''); sh._set(10, ID + 1, '99');
+  call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(-1, '2026-09-01T00:00:00Z')], opts);
+  assert.deepStrictEqual(ids(sh).slice(-2), ['-1', '99']);
+});
+test('upsert_ without opts still appends at the bottom', () => {
+  const sh = new FakeSheet();
+  call('ensureHeaders_', sh, ORDER_HEADERS, ORDER_LAYOUT);
+  call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(1, '2026-10-01T00:00:00Z')]);
+  call('upsert_', sh, ORDER_HEADERS, 'Shopify ID', [mkOrder(2, '2026-10-02T00:00:00Z')]);
+  assert.deepStrictEqual(ids(sh), ['1', '2']);
+});
+const ordersPage = nodes => (u, o) => {
+  const q = JSON.parse(o.payload).query;
+  const root = q.includes('draftOrders') ? 'draftOrders' : q.includes('abandonedCheckouts') ? 'abandonedCheckouts' : 'orders';
+  return resp(200, { data: { [root]: { nodes: root === 'orders' ? nodes : [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+};
+test('syncSource_ resort: sorts only when rows were added; top re-anchors the status rule', () => {
+  props.TOKEN = 'x'; props.TOKEN_EXPIRES = String(Date.now() + 86400000);
+  const sh = new FakeSheet(); sheets['Orders'] = sh;
+  call('ensureHeaders_', sh, ORDER_HEADERS, ORDER_LAYOUT);
+  const src = run('SOURCES').find(s => s.key === 'orders');
+  const node = (id, iso) => Object.assign({}, order, { legacyResourceId: String(id), createdAt: iso });
+  const rc = Object.assign({}, cfg, { row_order_orders: 'resort' });
+  ctx.__fetch = ordersPage([node(1, '2026-10-01T00:00:00Z'), node(3, '2026-10-03T00:00:00Z'), node(2, '2026-10-02T00:00:00Z')]);
+  call('syncSource_', src, rc, new Date('2026-10-01T00:00:00Z'), null, Date.now() + 60000);
+  assert.deepStrictEqual(ids(sh), ['3', '2', '1']);
+  assert.strictEqual(sh.sorted, 1);
+  call('syncSource_', src, rc, new Date('2026-10-01T00:00:00Z'), null, Date.now() + 60000);
+  assert.strictEqual(sh.sorted, 1, 'no new rows, no sort');
+  // top mode: the grey rule shifted to row 5 is replaced by one anchored at row 2
+  sh.rules = [{ getBooleanCondition: () => ({ getCriteriaValues: () => ['=$H5="Cancelled"'] }) }];
+  ctx.__fetch = ordersPage([node(4, '2026-10-04T00:00:00Z')]);
+  call('syncSource_', src, Object.assign({}, cfg, { row_order_orders: 'top' }), new Date('2026-10-01T00:00:00Z'), null, Date.now() + 60000);
+  assert.strictEqual(ids(sh)[0], '4');
+  assert.deepStrictEqual(sh.rules.map(r => r.getBooleanCondition().getCriteriaValues()[0]), ['=$H2="Cancelled"']);
+});
+test('getSettings_/ensureSettings_: defaults, dropdowns, invalid values, existing values kept', () => {
+  const st = new FakeSheet(); sheets['Settings'] = st;
+  st.data = [['country_code', '254'], ['sync_every', 'weekly'], ['sync_hour', '30'], ['row_order_orders', 'sideways']];
+  call('ensureSettings_');
+  const keys = st.data.map(r => r[0]);
+  assert.ok(['row_order_drafts', 'row_order_abandoned', 'timezone'].every(k => keys.includes(k)));
+  assert.strictEqual(st.data[0][1], '254', 'existing value untouched');
+  assert.strictEqual(keys.filter(k => k === 'sync_every').length, 1, 'no duplicate rows');
+  assert.ok(Object.values(st.validation).some(v => v.list.includes('resort')));
+  let c = call('getSettings_');
+  assert.deepStrictEqual([c.sync_every, c.sync_hour, c.row_order_orders, c.row_order_drafts], ['1h', 6, 'top', 'top']);
+  assert.deepStrictEqual([c.sync_interval_ms, c.schedule_id], [3600000, '1h']);
+  st.data[1][1] = 'daily'; st.data[2][1] = '7';
+  c = call('getSettings_');
+  assert.deepStrictEqual([c.sync_interval_ms, c.schedule_id], [86400000, 'daily@7']);
+  st.data[1][1] = '15m';
+  assert.strictEqual(call('getSettings_').sync_interval_ms, 900000);
+});
+const trig = () => ctx.ScriptApp.triggers.filter(t => t.handler === 'syncAll');
+test('installTrigger_: minutes, hours, daily at hour in Settings timezone', () => {
+  ctx.ScriptApp.triggers = []; ctx.__user = 'owner@x.co';
+  const base = { timezone: 'Africa/Kampala', sync_hour: 6 };
+  call('installTrigger_', Object.assign({}, base, { sync_every: '15m', schedule_id: '15m' }));
+  assert.deepStrictEqual(J(trig()[0].calls), [['timeBased'], ['everyMinutes', 15]]);
+  call('installTrigger_', Object.assign({}, base, { sync_every: '4h', schedule_id: '4h' }));
+  assert.strictEqual(trig().length, 1, 'old trigger removed');
+  assert.deepStrictEqual(J(trig()[0].calls), [['timeBased'], ['everyHours', 4]]);
+  call('installTrigger_', Object.assign({}, base, { sync_every: 'daily', schedule_id: 'daily@6' }));
+  assert.deepStrictEqual(J(trig()[0].calls), [['timeBased'], ['everyDays', 1], ['atHour', 6], ['inTimezone', 'Africa/Kampala']]);
+  assert.deepStrictEqual([props.SYNC_SCHEDULE, props.TRIGGER_OWNER], ['daily@6', 'owner@x.co']);
+});
+test('runSync_: applies a changed schedule, owner only', () => {
+  props.TOKEN = 'x'; props.TOKEN_EXPIRES = String(Date.now() + 86400000);
+  sheets['Settings'].data = [['sync_every', '2h']];
+  ['Orders', 'Drafts', 'Abandoned checkouts'].forEach(n => { sheets[n] = new FakeSheet(); });
+  ctx.ScriptApp.triggers = []; ctx.__user = 'owner@x.co'; props.SYNC_SCHEDULE = '1h'; props.TRIGGER_OWNER = 'owner@x.co';
+  ctx.__fetch = ordersPage([]);
+  call('runSync_');
+  assert.strictEqual(props.SYNC_SCHEDULE, '2h');
+  assert.deepStrictEqual(J(trig()[0].calls), [['timeBased'], ['everyHours', 2]]);
+  sheets['Settings'].data[0][1] = '30m'; ctx.__user = 'someone@else.co';
+  call('runSync_');
+  assert.strictEqual(props.SYNC_SCHEDULE, '2h', 'non-owner run does not install a second trigger');
+  ctx.__user = 'owner@x.co';
+});
+test('runSync_: resumes from the saved page cursor with the same query, then advances the cursor', () => {
+  ['ORDERS', 'DRAFTS', 'ABANDONED'].forEach(k => { props[k + '_CURSOR'] = '2026-10-14T00:00:00.000Z'; });
+  props.ORDERS_CURSOR_AFTER = 'c1'; props.ORDERS_CURSOR_SINCE = '2026-10-13T23:50:00.000Z'; props.ORDERS_CURSOR_STARTED = '2026-10-14T05:00:00.000Z';
+  const seen = [];
+  const page = ordersPage([]);
+  ctx.__fetch = (u, o) => { const v = JSON.parse(o.payload); if (!v.query.includes('draftOrders') && !v.query.includes('abandoned')) seen.push(v.variables); return page(u, o); };
+  call('runSync_');
+  assert.deepStrictEqual([seen[0].after, seen[0].q], ['c1', "updated_at:>='2026-10-13T23:50:00Z' test:false"]);
+  assert.strictEqual(props.ORDERS_CURSOR, '2026-10-14T05:00:00.000Z', 'cursor = start of the interrupted run');
+  assert.ok(!('ORDERS_CURSOR_AFTER' in props) && !('ORDERS_CURSOR_SINCE' in props));
+});
+test('runSync_: out of time saves the page cursor and schedules continueSync', () => {
+  ctx.ScriptApp.triggers = [];
+  let n = 0;
+  ctx.__fetch = (u, o) => {
+    const q = JSON.parse(o.payload).query;
+    if (q.includes('query Orders')) { n++; return resp(200, { data: { orders: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'p' + n } } } }); }
+    return ordersPage([])(u, o);
+  };
+  const realNow = Date.now; let t = realNow();
+  ctx.Date.now = () => (t += 60 * 1000); // each call moves a minute, so the 4.5 min budget runs out
+  try { call('runSync_'); } finally { ctx.Date.now = realNow; }
+  assert.ok(props.ORDERS_CURSOR_AFTER && props.ORDERS_CURSOR_SINCE && props.ORDERS_CURSOR_STARTED);
+  assert.strictEqual(ctx.ScriptApp.triggers.filter(t => t.handler === 'continueSync').length, 1);
+  ['_AFTER', '_SINCE', '_STARTED'].forEach(s => delete props['ORDERS_CURSOR' + s]);
+});
+test('resolveRecovered_: no-match waits at least two sync intervals', () => {
+  props.TOKEN = 'x'; props.TOKEN_EXPIRES = String(Date.now() + 86400000);
+  const sh = new FakeSheet(); sheets['Abandoned checkouts'] = sh;
+  const ago = min => new Date(Date.now() - min * 60000).toISOString();
+  const mk = (id, min) => call('checkoutToRecord_', Object.assign({}, checkout, { id: 'gid://shopify/AbandonedCheckout/' + id, abandonedCheckoutUrl: 'https://s/none', completedAt: ago(min), customer: { displayName: 'Q', defaultEmailAddress: { emailAddress: 'q@x.co' } } }), cfg);
+  call('upsert_', sh, ABANDONED_HEADERS, 'Shopify ID', [mk(1, 45), mk(2, 180)]);
+  ctx.__fetch = () => resp(200, { data: { orders: { nodes: [] } } });
+  call('resolveRecovered_', Object.assign({}, cfg, { sync_interval_ms: 3600000 }), Date.now() + 60000);
+  const m = call('ensureHeaders_', sh, ABANDONED_HEADERS);
+  assert.strictEqual(sh._cell(2, m['Order #']), '');
+  assert.strictEqual(sh._cell(3, m['Order #']), 'no match');
 });
 
 console.log('\n' + passed + ' passed' + (process.exitCode ? ', with failures' : ''));
